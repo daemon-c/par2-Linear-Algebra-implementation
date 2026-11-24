@@ -1,7 +1,9 @@
 #include <iostream>
 #include <fstream>
+#include <iomanip>
 
 #include "classes/archive.h"
+#include "classes/bit_flip.h"
 
 
 // Christian Valdez
@@ -32,37 +34,97 @@
  */
 
 
-/**
- * @TODO add a bit flip simulator
- */
-
-
- // test program that creates and archive object, ingests file into it, encodes the file, outputs how many bits were in the original file and creats a .laetf encoded archive file. Then can decode the file, and reproduce the file exactly as it was
-int main()
+int main(int argc, char* argv[])
 {
+    if (argc == 3 && std::string(argv[1]) == "-bitflip")
+    {
+        std::cout << "this will permanently flip one random bit in "
+                  << argv[2] << ". continue? [y/n] ";
+
+        char answer;
+        std::cin >> answer;
+        if (answer != 'y' && answer != 'Y')
+        {
+            std::cout << "bit flip cancelled.\n";
+            return 0;
+        }
+
+        BitFlipInfo flip;
+        if (!BitFlipSimulator::flipRandomBitInPlace(argv[2], flip))
+        {
+            std::cerr << "failed to flip a bit in the archive.\n";
+            return 1;
+        }
+
+        auto printBytes = [](const std::array<unsigned char, 4>& bytes,
+                             std::size_t count)
+        {
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                std::cout << std::hex << std::setw(2) << std::setfill('0')
+                          << static_cast<unsigned>(bytes[i]) << ' ';
+            }
+            std::cout << std::dec << '\n';
+        };
+
+        std::cout << "flipped archive byte " << flip.archiveOffset
+                  << ", bit " << flip.bitFromMsb
+                  << " from 0x" << std::hex << std::setw(2)
+                  << std::setfill('0')
+                  << static_cast<unsigned>(flip.oldByte)
+                  << " to 0x" << std::setw(2)
+                  << static_cast<unsigned>(flip.newByte) << std::dec << '\n';
+        std::cout << "previous bytes: ";
+        printBytes(flip.before, flip.beforeCount);
+        std::cout << "following bytes: ";
+        printBytes(flip.after, flip.afterCount);
+        return 0;
+    }
+
+    if (argc != 4)
+    {
+        std::cerr << "usage: ./main -encode inputfile outputfile.laetf\n"
+                  << "       ./main -decode archive.laetf recoveredfile\n"
+                  << "       ./main -bitflip archive.laetf\n";
+        return 1;
+    }
+
     Archive archive;
-
-    if (!archive.encodeFile("test.txt"))
+    if (std::string(argv[1]) == "-decode")
     {
-        std::cerr << "Failed to encode file.\n";
+        if (!archive.decodeFile(argv[2], argv[3]))
+        {
+            std::cerr << "failed to decode archive";
+            if (!archive.getLastDecodeError().empty())
+                std::cerr << ": " << archive.getLastDecodeError();
+            std::cerr << '\n';
+            return 1;
+        }
+
+        std::cout << "file recovered: " << argv[3]
+                  << ". corrected codewords: "
+                  << archive.getCorrectedCodewords() << '\n';
+        return 0;
+    }
+
+    if (std::string(argv[1]) != "-encode")
+    {
+        std::cerr << "unknown mode: " << argv[1] << '\n';
         return 1;
     }
 
-    if (!archive.saveFile("test.laetf"))
+    if (!archive.encodeFile(argv[2]))
     {
-        std::cerr << "Failed to save archive.\n";
+        std::cerr << "failed to encode input file.\n";
         return 1;
     }
 
-    std::cout << "File archived successfully.\n";
-
-    if (!archive.decodeFile("test.laetf", "recovered.txt"))
+    if (!archive.saveFile(argv[3]))
     {
-        std::cerr << "Failed to decode archive.\n";
+        std::cerr << "failed to save archive.\n";
         return 1;
     }
 
-    std::cout << "File recovered successfully.\n";
-
+    std::cout << "archive created: " << argv[3] << '\n';
     return 0;
 }

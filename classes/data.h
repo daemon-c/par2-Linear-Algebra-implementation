@@ -6,12 +6,12 @@
 
 class Data {
     private:
-        // pre defining the size 4 here since 74 hamming codes takes 4 bits of data and make a encoded vecotr of data with it. 
+        // pre defining the size 4 here since 7,4 hamming codes takes 4 bits of data and make a encoded vecotr of data with it.
         // Note to self: we will be taking the bool values and turning them to digits somehow
         bool data[4] = {0, 0, 0, 0};
 
         // traditional generator matrix style "G"
-        bool encoderMatrix[4][7] = {    
+        bool encoderMatrix[4][7] = {
             {1, 1, 1, 0, 0, 0, 0},
             {1, 0, 0, 1, 1, 0, 0},
             {0, 1, 0, 1, 0, 1, 0},
@@ -19,7 +19,7 @@ class Data {
         };
 
         bool encodedData[7] = {0, 0, 0, 0, 0, 0, 0};
-        
+
     public:
         // default constructor.
         Data() = default;

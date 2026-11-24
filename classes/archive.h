@@ -1,26 +1,105 @@
 #pragma once
 
 #include <fstream>
-#include <vector>
 #include <string>
 #include "data.h"
+#include <array>
+#include <cstdint>
+#include <limits>
+#include <cstdio>
+#include <openssl/evp.h>
 
 // fun fact, a nibble is the word for exactly 4 bits
 // 8 bits is a byte
 
 class Archive {
 private:
-    std::vector<bool> encodedBits; // vector here as we need a dynamically growing container of bits for any given file type
-    // fun fact, the bool template here is a specialized vector which helps keep memory use down. It stores the bools as individual bits rather than reserving a full byte for each entry
+    std::uint64_t originalSize = 0;
+    std::array<unsigned char, 32> originalHash{};
+    bool archiveReady = false;
+    std::string sourceFilename;
+    std::size_t correctedCodewords = 0;
+    std::string lastDecodeError;
 
-    void encodeBinaryToBool(unsigned char nibble) // helper function to take bit chunks and turn them into bool representation that our logical operations need
+    class BitWriter {
+    private:
+        std::ostream& out;
+        unsigned char currentByte = 0;
+        int bitCount = 0;
+
+    public:
+        explicit BitWriter(std::ostream& stream) : out(stream) {}
+
+        bool writeBit(bool bit)
+        {
+            currentByte = static_cast<unsigned char>((currentByte << 1) | bit);
+            ++bitCount;
+
+            if (bitCount == 8)
+            {
+                out.put(static_cast<char>(currentByte));
+                currentByte = 0;
+                bitCount = 0;
+            }
+
+            return out.good();
+        }
+
+        bool finish()
+        {
+            if (bitCount != 0)
+            {
+                currentByte <<= (8 - bitCount);
+                out.put(static_cast<char>(currentByte));
+            }
+
+            return out.good();
+        }
+    };
+
+    class BitReader {
+    private:
+        std::istream& in;
+        unsigned char currentByte = 0;
+        int bitsRemaining = 0;
+
+    public:
+        explicit BitReader(std::istream& stream) : in(stream) {}
+
+        bool readBit(bool& bit)
+        {
+            if (bitsRemaining == 0)
+            {
+                char nextByte;
+                if (!in.get(nextByte))
+                    return false;
+
+                currentByte = static_cast<unsigned char>(nextByte);
+                bitsRemaining = 8;
+            }
+
+            bit = (currentByte & 0x80) != 0;
+            currentByte <<= 1;
+            --bitsRemaining;
+            return true;
+        }
+
+        bool paddingIsZero() const
+        {
+            return currentByte == 0;
+        }
+
+        bool hasExtraBytes()
+        {
+            return in.peek() != std::char_traits<char>::eof();
+        }
+    };
+
+    bool encodeNibble(unsigned char nibble, BitWriter& writer) const
     {
-        Data encoder; // creates a Data object that holds our 4 input bits and performs the Hamming encoding
+        Data encoder;
 
-        // shift the bits to the right to move the bit we want into the last position.
-        // & 1 isolates that bit by setting all the other bits to 0.
-        // this lets us pass each of the 4 bits individually into our Data object.
-        encoder.setData( 
+        encoder.setData(
             (nibble >> 3) & 1,
             (nibble >> 2) & 1,
             (nibble >> 1) & 1,
@@ -31,18 +110,20 @@ private:
 
         std::array<bool, 7> result = encoder.getEncodedData();
 
-        for (int i = 0; i < 7; i++)
-        {
-            encodedBits.push_back(result[i]); // loops over the resulting encoded data object and pushes each set of 7 encoded bits into the vector object
-        }
+        for (bool bit : result)
+            if (!writer.writeBit(bit))
+                return false;
+
+        return true;
     }
 
 
     bool correctEncodedData(std::array<bool, 7>& encodedData)
     {
-        // based on parity bits being in the 3, 5, 6, 7 positions
+        // based on data bits being in the 3, 5, 6, 7 positions
+        // parity bits sit in positions 1, 2, and 4
         // the std parity check matrix. produces syndrom when we multiply it with our encodedData object
-        const bool Hmatrix[3][7] = { 
+        const bool Hmatrix[3][7] = {
             {0, 0, 0, 1, 1, 1, 1},
             {0, 1, 1, 0, 0, 1, 1},
             {1, 0, 1, 0, 1, 0, 1}
@@ -71,14 +152,70 @@ private:
 
         // note that the syndrome should be all 0s
         // Ax = 0 (every valid encodedData or codeword object is in the Nullspace of the H-parity check matrix)
-        if (syndrome != 0) 
+        if (syndrome != 0)
         {
             encodedData[syndrome - 1] = !encodedData[syndrome - 1];
+            ++correctedCodewords;
             return true;
         }
 
         return false;
     }
+
+    // Hash helper used to verify the recovered file.
+    static bool calculateHash(
+        const std::string& filename,
+        std::array<unsigned char, 32>& digest)
+    {
+        std::ifstream file(filename, std::ios::binary);
+
+        if (!file.is_open())
+            return false;
+
+        EVP_MD_CTX* context = EVP_MD_CTX_new();
+
+        if (context == nullptr)
+            return false;
+
+        bool success =
+            EVP_DigestInit_ex(context, EVP_sha256(), nullptr) == 1;
+
+        char buffer[65536];
+
+        while (success && file.read(buffer, sizeof(buffer)))
+        {
+            success =
+                EVP_DigestUpdate(context, buffer, sizeof(buffer)) == 1;
+        }
+
+        if (success && file.bad())
+            success = false;
+
+        if (success && file.gcount() > 0)
+        {
+            success = EVP_DigestUpdate(
+                context,
+                buffer,
+                static_cast<std::size_t>(file.gcount())
+            ) == 1;
+        }
+
+        unsigned int digestLength = 0;
+
+        if (success)
+        {
+            success = EVP_DigestFinal_ex(
+                context,
+                digest.data(),
+                &digestLength
+            ) == 1 && digestLength == digest.size();
+        }
+
+        EVP_MD_CTX_free(context);
+
+        return success;
+    }
+
 
 
     unsigned char decodeNibble(std::array<bool, 7> encodedData)
@@ -98,12 +235,80 @@ private:
         return nibble;
     }
 
+    // helper functions for 64bit ints. using big endian
+    static void writeUint64(std::ostream& out, std::uint64_t value)
+    {
+        for (int i = 7; i >= 0; i--)
+        {
+            unsigned char byte =
+                static_cast<unsigned char>((value >> (i * 8)) & 0xFF);
+
+            out.put(static_cast<char>(byte));
+        }
+    }
+
+    static bool readUint64(std::istream& in, std::uint64_t& value)
+    {
+        value = 0;
+
+        for (int i = 0; i < 8; i++)
+        {
+            char byte;
+
+            if (!in.get(byte))
+                return false;
+
+            value = (value << 8)
+                | static_cast<unsigned char>(byte);
+        }
+
+        return true;
+    }
+
+    // writes file header bytes so we have a actual distringuishable file type, not just assuming
+    /**
+     * @brief information about the file is stored in header. This helper function builds this metadata into the .laetf file
+     */
+    bool writeHeader(std::ostream& out) const
+    {
+        // magic number: 4 bytes
+        out.write("LAET", 4);
+
+        // version: 1 byte
+        out.put(static_cast<char>(1));
+
+        // flags: 1 byte (currently unused)
+        out.put(static_cast<char>(0));
+
+        // reserved: 2 bytes
+        out.put(static_cast<char>(0));
+        out.put(static_cast<char>(0));
+
+        // original size: 8 bytes
+        writeUint64(out, originalSize);
+
+        // original SHA-256 digest: 32 bytes
+        out.write(
+            reinterpret_cast<const char*>(originalHash.data()),
+            originalHash.size()
+        );
+
+        return out.good();
+    }
+
+
+
 
 
 public:
     bool encodeFile(const std::string& filename)
     {
-        std::ifstream file(filename, std::ios::binary); 
+        archiveReady = false;
+        originalSize = 0;
+        originalHash.fill(0);
+        sourceFilename.clear();
+
+        std::ifstream file(filename, std::ios::binary);
         // opens the file in binary mode so we can read the raw bytes without text conversions
 
         if (!file.is_open())
@@ -115,23 +320,34 @@ public:
 
         while (file.get(byte))
         {
-            unsigned char value = static_cast<unsigned char>(byte);
-            
-            // each byte contains 8 bits, but Hamming (7,4) only accepts 4 bits at a time.
-            // we split the byte into two nibbles so each can be encoded separately.
-            unsigned char upper = (value >> 4) & 0x0F;
-            unsigned char lower = value & 0x0F;
-
-            encodeBinaryToBool(upper);
-            encodeBinaryToBool(lower);
+            ++originalSize;
         }
 
-        return !file.bad();
+
+        if (file.bad())
+        {
+            return false;
+        }
+
+        // Calculate SHA-256 of the original file.
+        if (!calculateHash(filename, originalHash))
+        {
+            return false;
+        }
+
+        sourceFilename = filename;
+        archiveReady = true;
+
+        return true;
+
     }
 
 
     bool decodeFile(const std::string& inputFilename, const std::string& outputFilename)
     {
+        correctedCodewords = 0;
+        lastDecodeError.clear();
+
         std::ifstream in(inputFilename, std::ios::binary);
 
         if (!in.is_open())
@@ -139,33 +355,16 @@ public:
             return false;
         }
 
-        std::vector<bool> bits;
-
-        char byte;
-
-        // unpack archived bytes into individual bits.
-        while (in.get(byte))
-        {
-            unsigned char value = static_cast<unsigned char>(byte);
-
-            for (int i = 7; i >= 0; i--)
-            {
-                bits.push_back((value >> i) & 1);
-            }
-        }
-
-        if (in.bad())
+        // input stream is set at byte position 48
+        std::uint64_t originalBytes = 0;
+        std::array<unsigned char, 32> expectedHash{};
+        if (!readHeader(in, originalBytes, expectedHash))
         {
             return false;
         }
 
-        // every original byte generates 14 encoded bits.
-        std::size_t originalBytes = bits.size() / 14;
-
-        // validate that the file has a possible encoded size.
-        std::size_t expectedBits = ((originalBytes * 14 + 7) / 8) * 8;
-
-        if (expectedBits != bits.size())
+        // Make sure arithmetic cannot overflow.
+        if (originalBytes > std::numeric_limits<std::size_t>::max() / 14)
         {
             return false;
         }
@@ -177,24 +376,20 @@ public:
             return false;
         }
 
-        std::size_t position = 0;
+        BitReader reader(in);
 
         for (std::size_t i = 0; i < originalBytes; i++)
         {
             std::array<bool, 7> upperData{};
             std::array<bool, 7> lowerData{};
 
-            // extract the first seven-bit codeword.
-            for (int j = 0; j < 7; j++)
-            {
-                upperData[j] = bits[position++];
-            }
+            for (bool& bit : upperData)
+                if (!reader.readBit(bit))
+                    return false;
 
-            // extract the second seven-bit codeword.
-            for (int j = 0; j < 7; j++)
-            {
-                lowerData[j] = bits[position++];
-            }
+            for (bool& bit : lowerData)
+                if (!reader.readBit(bit))
+                    return false;
 
             // correct errors and recover four data bits each.
             unsigned char upper = decodeNibble(upperData);
@@ -206,53 +401,127 @@ public:
             out.put(static_cast<char>(originalByte));
         }
 
+        if (!reader.paddingIsZero() || reader.hasExtraBytes())
+            return false;
+
         out.close();
 
-        return out.good();
+        if (!out.good())
+        {
+            return false;
+        }
+
+        std::array<unsigned char, 32> recoveredHash{};
+
+        if (!calculateHash(outputFilename, recoveredHash))
+        {
+            return false;
+        }
+
+        if (recoveredHash != expectedHash)
+        {
+            lastDecodeError =
+                "sha-256 mismatch, archive may contain multiple-bit corruption";
+            std::remove(outputFilename.c_str());
+            return false;
+        }
+
+        return true;
     }
 
 
-    const std::vector<bool>& getEncodedBits() const
+    std::size_t getCorrectedCodewords() const
     {
-        return encodedBits;
+        return correctedCodewords;
     }
 
-    
+
+    const std::string& getLastDecodeError() const
+    {
+        return lastDecodeError;
+    }
+
+
     bool saveFile(const std::string& filename) const
     {
         std::ofstream out(filename, std::ios::binary);
+        // new logic to make sure file is archivable and has the required header information encoded into it
+        if (!archiveReady)
+        {
+            return false;
+        }
 
         if (!out.is_open())
         {
             return false;
         }
 
-        unsigned char currentByte = 0;
-        int bitCount = 0;
 
-        for (bool bit : encodedBits)
+        if (!writeHeader(out))
         {
-            currentByte = (currentByte << 1) | bit;
-            bitCount++;
-
-            if (bitCount == 8)
-            {
-                out.put(static_cast<char>(currentByte));
-
-                currentByte = 0;
-                bitCount = 0;
-            }
+            return false;
         }
 
-        // pad the remaining bits with zeros.
-        if (bitCount > 0)
+        std::ifstream source(sourceFilename, std::ios::binary);
+        if (!source.is_open())
+            return false;
+
+        BitWriter writer(out);
+        char byte;
+        while (source.get(byte))
         {
-            currentByte <<= (8 - bitCount);
-            out.put(static_cast<char>(currentByte));
+            unsigned char value = static_cast<unsigned char>(byte);
+            if (!encodeNibble((value >> 4) & 0x0F, writer) ||
+                !encodeNibble(value & 0x0F, writer))
+                return false;
         }
 
-        out.close();
+        if (source.bad() || !writer.finish())
+            return false;
+
         return out.good();
     }
+
+
+    // does a reverse of what writeHeader() does, it will read and validate the header.
+    static bool readHeader(
+        std::istream& in,
+        std::uint64_t& fileSize,
+        std::array<unsigned char, 32>& expectedHash)
+    {
+        char magic[4];
+
+        if (!in.read(magic, 4))
+            return false;
+
+        if (std::string(magic, 4) != "LAET")
+            return false;
+
+        // read version, flags, and reserved bytes
+        unsigned char metadata[4];
+
+        if (!in.read(reinterpret_cast<char*>(metadata), 4))
+            return false;
+
+        if (metadata[0] != 1)
+            return false;
+
+        // version 1 doesn't support any flags
+        if (metadata[1] != 0 ||
+            metadata[2] != 0 ||
+            metadata[3] != 0)
+            return false;
+
+        if (!readUint64(in, fileSize))
+            return false;
+
+        if (!in.read(
+                reinterpret_cast<char*>(expectedHash.data()),
+                expectedHash.size()))
+            return false;
+
+        return true;
+    }
+
 
 };
